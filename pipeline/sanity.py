@@ -135,6 +135,13 @@ def check_sentinels(places, cfg, partial):
 
 
 outline_tiles = strict.outline_tiles
+
+
+def _region_has_data(region, places, lighting):
+    """Whether a --partial build read any extract for this region: a tile of
+    its widened box holds a place or a lit way. (Complete tiles alone do not
+    say so: reviewed-empty tiles are complete in every build.)"""
+    return any(t in places.index or t in lighting.index for t in regions.region_tiles(region, widened=True))
 NEAR_DATA_TILES = 2
 
 
@@ -148,11 +155,7 @@ def check_strict(report, places, lighting, outline_path, partial, regions_cfg):
     errors = []
     names = [r['name'] for r in regions_cfg['regions']]
     if partial:
-        keep = []
-        for r in regions_cfg['regions']:
-            t = regions.region_tiles(r, widened=False)
-            if any(places.complete(tx, ty) for tx, ty in t):
-                keep.append(r)
+        keep = [r for r in regions_cfg['regions'] if _region_has_data(r, places, lighting)]
         area = set()
         for r in keep:
             area.update(regions.region_tiles(r, widened=False))
@@ -190,10 +193,8 @@ def check_coverage(report, known, places, lighting, outline_path, partial, regio
         k = known['regions'].get(name, {'places': [], 'lighting': []})
         for key, field in (('places', 'places_incomplete_tiles'), ('lighting', 'lighting_incomplete_tiles')):
             holes = set(r[field])
-            if partial and name in boxes:
-                total = len(regions.region_tiles(boxes[name], widened=(key == 'lighting')))
-                if len(holes) == total:
-                    continue        # a region this partial build has no data for
+            if partial and name in boxes and not _region_has_data(boxes[name], places, lighting):
+                continue            # a region this partial build has no data for
             extra = sorted(holes - set(k[key]))
             if extra:
                 errors.append(f'region {name}: {len(extra)} {key} tiles incomplete that are not known water, e.g. {extra[:5]}')
