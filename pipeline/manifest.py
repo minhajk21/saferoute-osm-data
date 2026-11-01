@@ -47,7 +47,8 @@ def source_entry(sid, s):
             'seconds': s.get('timings')}
 
 
-def build_manifest(out_dir, sources, report, regions_cfg, index_info, golden, sanity, commit=None, run_url=None):
+def build_manifest(out_dir, sources, report, regions_cfg, index_info, golden, sanity, commit=None, run_url=None,
+                   tag=None):
     assets = {}
     for name in ('lighting.pack', 'places.pack', 'ATTRIBUTION.txt', 'LICENSE-DATA.md'):
         p = os.path.join(out_dir, name)
@@ -69,6 +70,10 @@ def build_manifest(out_dir, sources, report, regions_cfg, index_info, golden, sa
     return {
         'schema': 1,
         'name': 'saferoute-osm-data',
+        # The release this manifest belongs to: an unpinned reader fetches the
+        # packs from this tag, not from "latest" (which may move between its
+        # requests).
+        'tag': tag,
         'built_at': iso(report['built_at']),
         'data_as_of': iso(report['data_as_of']),
         'data_as_of_epoch': report['data_as_of'],
@@ -80,14 +85,15 @@ def build_manifest(out_dir, sources, report, regions_cfg, index_info, golden, sa
         'sources': [source_entry(sid, s) for sid, s in sorted(sources.items())],
         'assets': assets,
         'regions': regions,
+        'reviewed_empty': report.get('reviewed_empty'),
         'golden': golden,
-        'sanity': {k: sanity.get(k) for k in ('ok', 'errors', 'warnings', 'notes', 'sentinels_checked')},
+        'sanity': {k: sanity.get(k) for k in ('ok', 'errors', 'warnings', 'notes', 'sentinels_checked', 'strict')},
     }
 
 
 def latest(manifest, tag, manifest_sha256):
     return {'tag': tag, 'built_at': manifest['built_at'], 'data_as_of': manifest['data_as_of'],
-            'manifest_sha256': manifest_sha256,
+            'data_as_of_epoch': manifest['data_as_of_epoch'], 'manifest_sha256': manifest_sha256,
             'assets': {k: {'bytes': v['bytes'], 'sha256': v['sha256']} for k, v in manifest['assets'].items()},
             'counts': {'lit_ways': manifest['assets']['lighting.pack']['ways'],
                        'places': manifest['assets']['places.pack']['elements']}}

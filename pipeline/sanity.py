@@ -15,7 +15,13 @@ Usage:
              (matched by name near a point) only warn.
   coverage   every incomplete tile in a region box (places) or widened box
              (lighting), and in the app's UK outline, must be listed in
-             config/known_incomplete.json (open water).
+             config/known_incomplete.json (outside every extract polygon).
+  strict     the backend never asks Overpass inside the strict area (region
+             boxes + UK outline, pipeline/strict.py), so EVERY places tile
+             there must be complete (reviewed-empty tiles count); and no
+             lighting hole there may lie within 2 tiles of a complete tile
+             with data (a hole next to streets is not open water: review it).
+             A reviewed-empty tile that data touches fails too.
 --partial (local test builds of a few extracts) skips regions and sentinels
 the packs have no data for and the UK outline, and reports coverage holes as
 warnings (a region's neighbouring extracts are not in such a build).
@@ -31,7 +37,7 @@ import sys
 if __package__ in (None, ''):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pipeline import coverage, packfmt, regions, tiles  # noqa: E402
+from pipeline import coverage, packfmt, regions, strict, tiles  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOW, HIGH = 0.90, 1.25
@@ -128,14 +134,53 @@ def check_sentinels(places, cfg, partial):
     return errors, warnings, checked
 
 
-def outline_tiles(path):
-    rings = _load(path)['rings']
-    out = set()
-    for ring in rings:
-        poly = coverage.Polygon(coverage.geometry_edges({'type': 'Polygon', 'coordinates': [ring]}))
-        for ry, cols in coverage.touched_tiles(poly).items():
-            out.update((tx, ry) for tx in cols)
-    return out
+outline_tiles = strict.outline_tiles
+NEAR_DATA_TILES = 2
+
+
+def _has_data(pack, tx, ty):
+    return (tx, ty) in pack.index and pack.complete(tx, ty)
+
+
+def check_strict(report, places, lighting, outline_path, partial, regions_cfg):
+    """Errors for the strict area (see the module doc). In a --partial build
+    only the regions it has any data for are looked at, as warnings."""
+    errors = []
+    names = [r['name'] for r in regions_cfg['regions']]
+    if partial:
+        keep = []
+        for r in regions_cfg['regions']:
+            t = regions.region_tiles(r, widened=False)
+            if any(places.complete(tx, ty) for tx, ty in t):
+                keep.append(r)
+        area = set()
+        for r in keep:
+            area.update(regions.region_tiles(r, widened=False))
+        names = [r['name'] for r in keep]
+    else:
+        area = strict.strict_tiles(regions_cfg, outline_path)
+    p_holes = sorted((tx, ty) for tx, ty in area if not places.complete(tx, ty))
+    if p_holes:
+        errors.append(f'strict area: {len(p_holes)} Find Help tiles incomplete, where the backend would refuse '
+                      f'rather than ask Overpass, e.g. {[f"{x},{y}" for x, y in p_holes[:5]]}')
+    near = []
+    for tx, ty in sorted(area):
+        if lighting.complete(tx, ty):
+            continue
+        if any(_has_data(lighting, tx + dx, ty + dy)
+               for dx in range(-NEAR_DATA_TILES, NEAR_DATA_TILES + 1)
+               for dy in range(-NEAR_DATA_TILES, NEAR_DATA_TILES + 1)):
+            near.append(f'{tx},{ty}')
+    if near:
+        errors.append(f'strict area: {len(near)} lighting tiles incomplete within {NEAR_DATA_TILES} tiles of lit '
+                      f'streets (not open water: fix the sources or review them), e.g. {near[:5]}')
+    rev = report.get('reviewed_empty') or {}
+    for key in ('places', 'lighting'):
+        bad = (rev.get(key) or {}).get('contradicted') or []
+        if bad:
+            errors.append(f'reviewed_empty: {len(bad)} {key} tiles reviewed as empty have data, e.g. {bad[:5]}')
+    return errors, {'regions': len(names), 'tiles': len(area), 'places_holes': len(p_holes),
+                    'lighting_holes_near_data': len(near)}
 
 
 def check_coverage(report, known, places, lighting, outline_path, partial, regions_cfg):
@@ -184,8 +229,10 @@ def run(a):
     out['errors'] += errs
     out['warnings'] += warns
     out['sentinels_checked'] = n
-    errs, notes = check_coverage(report, _load(a.known), places, lighting, a.uk_outline, a.partial,
-                                 regions.load(a.regions))
+    regions_cfg = regions.load(a.regions)
+    errs, notes = check_coverage(report, _load(a.known), places, lighting, a.uk_outline, a.partial, regions_cfg)
+    errs2, out['strict'] = check_strict(report, places, lighting, a.uk_outline, a.partial, regions_cfg)
+    errs += errs2
     if a.partial:
         out['warnings'] += [f'(partial build) {e}' for e in errs]
     else:

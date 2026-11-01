@@ -97,6 +97,8 @@ def main(argv=None):
     ap.add_argument('--no-golden', action='store_true')
     ap.add_argument('--keep-downloads', action='store_true')
     ap.add_argument('--tag', help='release tag to record (default data-YYYY-MM-DD of the build)')
+    ap.add_argument('--reviewed', default=os.path.join(ROOT, 'config', 'reviewed_empty.json'),
+                    help='tiles reviewed as holding nothing either feature can return (pack.py)')
     args = ap.parse_args(argv)
 
     t_all = time.monotonic()
@@ -130,6 +132,10 @@ def main(argv=None):
     size, _, sha = sha256_and_size(index_path)
     index_info = {'url': idx_url, 'bytes': size, 'sha256': sha}
 
+    # ---- every extract resolved before any is downloaded (download.preflight)
+    remote = [src['url'] for src in cfg['sources'] if src['id'] not in local]
+    resolved = download.preflight(remote) if remote else {}
+
     # ---- extracts, one at a time
     store_path = os.path.join(args.work, 'store.sqlite')
     if os.path.exists(store_path):
@@ -149,7 +155,7 @@ def main(argv=None):
             info = {'url': src['url'], 'dated_url': None, 'bytes': n, 'md5': md5, 'sha256': sha, 'local': True}
             download.check_timestamp(extract.header_timestamp(path), prev_ts.get(sid), max_age_days=36500)
         else:
-            rec = download.download(src['url'], dl_dir, previous=prev_ts.get(sid))
+            rec = download.download(src['url'], dl_dir, previous=prev_ts.get(sid), dated=resolved[src['url']])
             path = rec.pop('path')
             info = rec
             dated[sid] = rec['dated_url']
@@ -166,7 +172,7 @@ def main(argv=None):
 
     # ---- pack
     t = time.monotonic()
-    rep = pack.build(store_path, index_path, args.regions, args.out)
+    rep = pack.build(store_path, index_path, args.regions, args.out, reviewed_path=args.reviewed)
     timings['pack_s'] = round(time.monotonic() - t, 1)
     log(f"packs: lighting {rep['lighting']['bytes']:,} B ({rep['lighting']['ways']:,} ways), "
         f"places {rep['places']['bytes']:,} B; {timings['pack_s']} s")
@@ -249,10 +255,11 @@ def main(argv=None):
     if os.environ.get('GITHUB_RUN_ID'):
         run_url = (f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/"
                    f"{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ['GITHUB_RUN_ID']}")
-    man = manifest.build_manifest(args.out, srcs, rep, regions_cfg, index_info, golden_res, san, commit, run_url)
+    tag = args.tag or 'data-' + manifest.iso(rep['built_at'])[:10]
+    man = manifest.build_manifest(args.out, srcs, rep, regions_cfg, index_info, golden_res, san, commit, run_url,
+                                  tag=tag)
     man_path = os.path.join(args.out, 'manifest.json')
     manifest.write_json(man_path, man)
-    tag = args.tag or 'data-' + man['built_at'][:10]
     with open(os.path.join(args.work, 'RELEASE_NOTES.md'), 'w', encoding='utf-8') as f:
         f.write(manifest.release_notes(man, tag))
     manifest.write_json(os.path.join(args.work, 'LATEST.json'), manifest.latest(man, tag, manifest.sha256_file(man_path)))

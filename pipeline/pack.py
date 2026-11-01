@@ -8,8 +8,9 @@ Usage:
 Each element goes into EVERY tile its geometry touches (closed tiles, DESIGN.md
 A1/A2/A6), so a tile's record is the Overpass answer for that tile. Only
 COMPLETE tiles are written (pipeline/coverage.py), minus any tile an element
-with missing nodes or members touches. Writes DIR/lighting.pack,
-DIR/places.pack and DIR/pack-report.json.
+with missing nodes or members touches, plus the tiles reviewed as empty
+(config/reviewed_empty.json, pipeline/strict.py) that no element touches.
+Writes DIR/lighting.pack, DIR/places.pack and DIR/pack-report.json.
 """
 import argparse
 import json
@@ -21,7 +22,7 @@ from collections import defaultdict
 if __package__ in (None, ''):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pipeline import coverage, packfmt, regions, store, tiles  # noqa: E402
+from pipeline import coverage, packfmt, regions, store, strict, tiles  # noqa: E402
 
 TYPE_ORDER = {'node': 0, 'way': 1, 'relation': 2}
 
@@ -55,7 +56,24 @@ def _is_complete(cov, tx, ty):
     return row is not None and tx in row
 
 
-def build(store_path, index_path, regions_path, out_dir, built_at=None):
+def _add_reviewed(cov, reviewed, touched):
+    """Marks each reviewed tile complete unless data touches it. Returns
+    (added, already complete, contradicted: [(tile, group)])."""
+    added = already = 0
+    contradicted = []
+    for t, group in sorted(reviewed.items(), key=lambda kv: (kv[0][1], kv[0][0])):
+        tx, ty = t
+        if t in touched:
+            contradicted.append((f'{tx},{ty}', group))
+        elif _is_complete(cov, tx, ty):
+            already += 1
+        else:
+            cov.setdefault(ty, set()).add(tx)
+            added += 1
+    return added, already, contradicted
+
+
+def build(store_path, index_path, regions_path, out_dir, built_at=None, reviewed_path=None):
     t_start = time.monotonic()
     built_at = int(built_at if built_at is not None else time.time())
     os.makedirs(out_dir, exist_ok=True)
@@ -145,6 +163,8 @@ def build(store_path, index_path, regions_path, out_dir, built_at=None):
         for t_ in tl:
             tile_elems[t_].append(el)
     _remove(place_cov, place_bad)
+    reviewed = strict.load_reviewed(reviewed_path)
+    p_added, p_already, p_contra = _add_reviewed(place_cov, reviewed['places'], tile_elems)
     places_path = os.path.join(out_dir, 'places.pack')
     pw = packfmt.PackWriter(places_path, packfmt.KIND_PLACES, data_as_of, built_at)
     ptiles = pmemb = 0
@@ -174,9 +194,11 @@ def build(store_path, index_path, regions_path, out_dir, built_at=None):
     db.execute('DROP TABLE IF EXISTS lit_member')
     db.execute('CREATE TABLE lit_member (ty INTEGER, tx INTEGER, id INTEGER, PRIMARY KEY (ty, tx, id)) WITHOUT ROWID')
     light_bad = set()
+    light_touched_reviewed = set()
     rows = []
     for wid, xy_blob, missing in db.execute('SELECT id, xy, missing FROM lit_way'):
         tl = tiles.path_tiles(store.unpack_xy(xy_blob))
+        light_touched_reviewed.update(t for t in tl if t in reviewed['lighting'])
         if missing:
             light_bad.update(tl)
         for tx, ty in tl:
@@ -187,6 +209,7 @@ def build(store_path, index_path, regions_path, out_dir, built_at=None):
             rows = []
     db.executemany('INSERT INTO lit_member VALUES (?,?,?)', rows)
     _remove(light_cov, light_bad)
+    l_added, l_already, l_contra = _add_reviewed(light_cov, reviewed['lighting'], light_touched_reviewed)
     light_path = os.path.join(out_dir, 'lighting.pack')
     lw = packfmt.PackWriter(light_path, packfmt.KIND_LIGHTING, data_as_of, built_at)
     region_ways = defaultdict(set)
@@ -244,6 +267,12 @@ def build(store_path, index_path, regions_path, out_dir, built_at=None):
         per_region[r['name']] = {'places': nplaces, 'lit_ways': len(region_ways.get(r['name'], ())),
                                  'places_incomplete_tiles': p_hole, 'lighting_incomplete_tiles': l_hole}
     report['regions'] = per_region
+    report['reviewed_empty'] = {
+        'places': {'reviewed': len(reviewed['places']), 'added': p_added, 'already_complete': p_already,
+                   'contradicted': [f'{t} ({g})' for t, g in p_contra]},
+        'lighting': {'reviewed': len(reviewed['lighting']), 'added': l_added, 'already_complete': l_already,
+                     'contradicted': [f'{t} ({g})' for t, g in l_contra]},
+    }
     report['coverage_seconds'] = round(cov_s, 2)
     report['seconds'] = round(time.monotonic() - t_start, 2)
     db.close()
@@ -258,8 +287,9 @@ def main(argv=None):
     ap.add_argument('--index', required=True, help="Geofabrik index-v1.json (the extracts' polygons)")
     ap.add_argument('--regions', required=True)
     ap.add_argument('--out', required=True)
+    ap.add_argument('--reviewed', help='config/reviewed_empty.json (tiles reviewed as empty)')
     a = ap.parse_args(argv)
-    rep = build(a.store, a.index, a.regions, a.out)
+    rep = build(a.store, a.index, a.regions, a.out, reviewed_path=a.reviewed)
     summary = {k: rep[k] for k in ('data_as_of', 'places', 'lighting', 'seconds')}
     print(json.dumps(summary, indent=1, sort_keys=True))
 

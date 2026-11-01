@@ -16,7 +16,7 @@ Code references are to backend commit `34ad0d1` (branch `overpass-stopgap`). The
   - over 10 days: degraded;
   - over 30 days: the copy is switched off and Overpass is used.
 
-  The monitor warns at more than 8 days and raises a critical alert at more than 10.
+  The monitor warns at more than 9 days and raises a critical alert at more than 10 (§11).
 - **The build cannot stop silently.** Three guards:
   - the public schedule, plus a weekly bot commit;
   - a private daily watchdog;
@@ -144,8 +144,8 @@ These are OSM's own integers, so decoding gives exactly the doubles that Overpas
 ## 4. Weekly build (public repo `minhajk21/saferoute-osm-data`)
 
 `.github/workflows/build.yml` runs on `ubuntu-24.04`, which for a public repo means 4 vCPU, 16 GB RAM and 14 GB SSD.
-- **Triggers:** `schedule` at `17 2 * * 0` (Sundays, after Geofabrik's daily run around 21:00 CET) and `workflow_dispatch`.
-- **Settings:** `timeout-minutes: 240`; permissions `contents: write`, `id-token: write`, `attestations: write`; actions pinned by SHA.
+- **Triggers:** `schedule` at `17 20 * * 0` (Sundays 20:17 UTC, once Geofabrik has Saturday's North American files: §11) and `workflow_dispatch`.
+- **Settings:** `timeout-minutes: 240`; two jobs (§11): `build` with `contents: read` only, and `publish` with `contents: write`, `id-token: write`, `attestations: write`; actions pinned by SHA.
 
 1. **Install:** `apt-get install osmium-tool`, then `pip install --require-hashes -r requirements.lock` (pyosmium and shapely, pinned). Fail if less than 6 GB of disk is free.
 2. **Download, one file at a time:**
@@ -159,11 +159,12 @@ These are OSM's own integers, so decoding gives exactly the doubles that Overpas
 6. **Sanity checks against the previous release.** Any failure stops the publish:
    - per-region place and way counts within −10% / +25%;
    - about 30 sentinel places present (for example University College Hospital, Bellevue, GW Hospital);
-   - every region box complete apart from the known water tiles.
+   - every region box complete apart from the known water tiles;
+   - every places tile of the strict area complete, and no lighting hole there next to lit streets (§11).
 7. **Publish:**
    - `actions/attest-build-provenance` on the packs and the manifest;
    - `gh release create data-YYYY-MM-DD` with the packs, `manifest.json` (each source's URL, bytes, MD5, SHA-256 and timestamp; each asset's bytes, SHA-256 and counts; the tool versions; `dataAsOf`; the region boxes), `ATTRIBUTION.txt` and `LICENSE-DATA.md`.
-8. **Keepalive:** commit `LATEST.json` (date, hashes, counts) and keep only the newest 8 releases.
+8. **Keepalive:** commit `LATEST.json` (date, hashes, counts). Delete a release only once it is over 26 weeks old and outside the newest 8 (§11).
 
 **Run time:** expected 30–75 min, a guess. Downloads dominate: about 12 GB at 10–40 MB/s. My pyosmium probe took 39 s for London.
 
@@ -176,54 +177,20 @@ These are OSM's own integers, so decoding gives exactly the doubles that Overpas
 
 **The 60-day disable.** GitHub turns off a public repo's schedule after 60 days with no activity (`overpass-outage-2026-10-31/overpass-ch-pages/gh_disable.html`). Three guards:
 - **(a)** The weekly bot commit is repository activity. That is likely, not proven, for a `GITHUB_TOKEN` push.
-- **(b)** A private-repo workflow, `osm-data.yml`, runs daily at 06:41 UTC. The rule applies to public repos only. It uses a fine-grained PAT, `OSM_DATA_TOKEN`, with Actions read/write on the data repo only:
+- **(b)** A private-repo workflow, `osm-data.yml` (template: `contrib/backend-osm-data-watchdog.yml`), runs every 6 hours. The rule applies to public repos only. It uses a fine-grained PAT, `OSM_DATA_TOKEN`, with Actions read/write on the data repo only, and only to enable and dispatch:
   - if the build workflow's state is not `active`, it runs `gh workflow enable`;
-  - if the newest release is more than 8 days old, it runs `gh workflow run build.yml`;
+  - if the newest release's *data* (`data_as_of_epoch` in its manifest) is more than 8.5 days old, it runs `gh workflow run build.yml`, unless a build is already queued or running, or the last one failed less than 72 hours ago (§11);
   - either way it then *fails*, so the run shows red.
-- **(c)** Even if (a) and (b) both fail, for example because the PAT expired, the data-age alert (§5) emails within 6 hours of the data passing 8 days.
+- **(c)** Even if (a) and (b) both fail, for example because the PAT expired, the data-age alert (§5) emails within 6 hours of the data passing 9 days.
 
-## 5. Backend
+## 5. Backend (summary)
 
-**Pin and fetch:**
-- When `osm-data.yml` finds a newer release, it runs:
-  - `gh attestation verify --repo minhajk21/saferoute-osm-data --signer-workflow …/build.yml`;
-  - its own recount of the SHA-256s;
-  - the sanity checks again.
-
-  If all pass, it commits `data/osm-manifest.json` (tag, asset names, bytes, SHA-256, `dataAsOf`) to `main`. Render auto-deploys; a deploy hook is the fallback.
-- The Render build command becomes `npm ci && node scripts/fetch-osm-data.mjs`. The script downloads the pinned assets and checks their size and SHA-256. A mismatch fails the build, so the previous deploy stays live.
-- At boot, `src/services/osmData.js` re-hashes the packs (~60 MB, under a second), checks the headers, and loads the index and coverage into typed arrays. Any failure leaves local data off and marks it on `/health`.
-- With no packs (local development, tests) everything behaves as it does today.
-
-**Memory:**
-- The packs stay on disk. Tiles are read on demand (`FileHandle.read`, asynchronous `inflateRaw`).
-- Lighting LRU: decoded tiles as Int32/Float64 typed arrays, capped at 40 MB. The densest London tile is about 140 KB.
-- Places LRU: the output of `normaliseElements` per tile, capped at 8 MB.
-- Both caps are environment variables. The total with the index is **about 52 MB**.
-- Each entry lives at most 24 h (`TILE_MAX_AGE_MS`, `safePlaces.js:64`), in memory only. The entries are keyed by tile, not by user, and the LRUs are cleared at restart.
-
-**Find Help.** In `fetchTile` (`safePlaces.js:323`), when the tile is complete and the data is no more than 30 days old, the entry is `{fetchedAt: loadedAt, places: normaliseElements(elements)}`. Everything else stays as it is:
-- otherwise the existing cache and `fetchTileFromOverpass` (`:411`) run unchanged;
-- one request may mix local tiles and Overpass tiles, and any failed tile still fails the whole request (502, retryable);
-- `cachedUntil` (`:236`) keeps its definition, so `Cache-Control` (`safePlacesRoute.js:36-37`), the status codes, the fields and the order (`:223`, a stable sort over Overpass-ordered tiles) are unchanged;
-- a local read or inflate error becomes a 502 and records a `data:osm` error.
-
-**Lighting.** In `fetchLitSegments` (`lighting.js:84`):
-- **Covered and fresh** (every tile of the padded box, `:89`):
-  1. collect the distinct ways that have a segment touching the padded box (A1);
-  2. stop at `MAX_WAYS + 1` and return `{index: null}`, as `:112` does;
-  3. otherwise build the same Overpass-shaped `ways` (id ascending, full geometry) for the unchanged index code (`:114-146`, moved into a pure `buildIndex`).
-
-  `classifyRoute` (`:168`) and `/route-lighting` (`index.js:364-378`) do not change. Inside coverage nothing is cached by route box (no `NodeCache`, `:55`).
-- **Otherwise:** the Overpass path, unchanged.
-
-**Health and monitor:**
-- `health.js` gains `recordDataAge(source, asOf, {degradeAfterMs})`. `isSourceDegraded` (`:168`) adds the age test, and `healthSummary` (`:249`) adds `osmData: {asOf, ageDays, state}` to `/health` (`index.js:142`). This is additive.
-- `state` is `ok`, `stale` (over 10 days: degraded, still served), `expired` (over 30 days: local off) or `missing`.
-- `scripts/monitor.mjs`:
-  - check 1 (`:134`) warns at more than 8 days and is critical at more than 10, or for any state other than `ok`;
-  - the lighting probe (3b, `:215`) now exercises local data;
-  - the Find Help probe (4b, `:250`) adds London and DC points and rates a failure as critical.
+The backend is private; its own `docs/osm-data.md` has the file-by-file map, the monitor thresholds and the policy edits that used to be here. In short:
+- **Pin.** A private watchdog verifies each new release (attestation from this repo's `build.yml` on `main`, the release's own sanity flag, every hash, data newer than the pinned data) and commits `data/osm-manifest.json` there. Render's build fetches and re-hashes the pinned packs; boot re-hashes them again.
+- **Memory.** The packs stay on disk. Only the tile index, coverage and strings are resident; tiles are read on demand into byte-capped caches (about 48 MB), each entry kept at most 1 hour.
+- **Answers.** Find Help per 0.02° tile, lighting per padded route box, from complete tiles only; the same JSON and the same algorithms as the Overpass path.
+- **Strict area.** Inside the backend's covered regions (every tile meeting a city box or the app's UK outline, `pipeline/strict.py`) the backend never asks Overpass once a pin is committed: with no usable copy, Find Help there answers its retryable 502 and lighting is null. That is why every release must have every strict tile complete (§4 step 6).
+- **Data age** is on `/health`: degraded past 10 days, the copy off past 30.
 
 ## 6. Proving it matches the Overpass path
 
@@ -255,62 +222,52 @@ Live Overpass is unusable, so the reference is a brute-force **Python emulator o
 - a compromised account or workflow. An attestation proves who built a file, not that it is benign;
 - Geofabrik serving altered data with a matching MD5.
 
-The pin makes every change of data an auditable, revertible commit in the private repo.
+The pin makes every change of data an auditable, revertible commit in the private repo. It is **not a review**: by default the watchdog commits each verified pin to the backend's `main` and Render deploys it, with nobody looking first. The gate is automatic (attestation, sanity, golden and strict-area checks, hashes). The watchdog's `OSM_PIN_MODE=pr` makes each pin a pull request instead, and a `data/osm-hold` file there stops it changing the pin (for a rollback that sticks).
 
-## 8. Policy and LIA consequences (for you)
+**The build job never holds a write token.** It parses about 12 GB of downloaded files with libosmium, so it runs with `contents: read`, no stored git credentials and no token in the build step's environment. A separate `publish` job, which never reads a `.pbf`, re-checks the hand-over against the manifest, attests, publishes and commits. A parser exploit in the build job could therefore produce bad packs (which the attestation would then truthfully say `build.yml` built), but could not sign or publish anything else.
 
-**Privacy:**
-- Inside covered tiles, no third party receives a lookup's map squares or a route's box.
-- Geofabrik and GitHub receive no user data: the downloads happen at build time, never per request.
-- Removing or narrowing a recipient may follow the deploy, with a dated Change note the same day.
+## 8. Policy and LIA consequences
 
-**Edits to the live policy (`saferoute-privacy/index.html`, `a2e138e`):**
-- The **Overpass row** (L625-628) narrows to "only for points or routes outside the areas our own copy covers, or while our copy is unavailable".
-- The **section 08 cache sentence** (L773) is rewritten. Lighting and place data come from our own weekly copy of OSM. Map squares about 2 km across are read into memory for up to 24 h, keyed by square, not by user. Route boxes are not cached inside covered areas.
-- L763 changes only if the fallback servers change.
-- Add a Change note and update the last-reviewed line (L914).
-
-**Your choice: fallback or strict.** If the copy expires (over 30 days) or is missing, covered points go to Overpass again, as today. If you prefer "never inside covered areas", choose "strict": Find Help returns the 502 and lighting returns null.
-
-**Still separate (critic's items):**
-- An overpass.ch fallback needs its row published *before* its deploy.
-- The Kumi Systems Correction is still due.
-- Lighting still has no lawful basis chosen.
-
-**LIA:** add the activity "lighting and Find Help answered from our own OSM copy; the point or route is used in memory for that request only".
-
-**Support page** (`saferoute-support/index.html:915-917`): it names the three Overpass mirrors, so update it on the same day.
+These are the owner's, in the private backend repo (`docs/osm-data.md`). Geofabrik and GitHub receive no user data from this repo: downloads happen at build time, never per request.
 
 ## 9. Owner actions, effort, open points
 
-**Owner actions:**
-- Create the public repo, push this one to it, and enable Actions.
-- Create the PAT and add it as `OSM_DATA_TOKEN` in the backend repo.
-- Change Render's build command. Check whether `main` is protected and whether auto-deploy is on.
-- Choose fallback or strict.
-- Publish the policy and support edits.
-
-**Effort:** about 5–6 days (a guess): pipeline 2, backend 1.5, golden tests 1.5, workflows 0.5–1.
-
-**Open points:**
-- A1–A6 are unverified until the anchor check runs.
-- Whether a `GITHUB_TOKEN` commit counts as activity is unproven; the watchdog covers it.
-- Memory headroom on Starter is unmeasured. Read Render's metrics before tuning the caps.
-- Whether Render deploys on a `GITHUB_TOKEN` push is unverified; the deploy hook is the fallback.
-- Later option: places for the remaining US states and Ireland, about +4 GB per run, would make Find Help local across the whole US.
+In the private backend repo (`docs/osm-data.md`). The public open points:
+- A1–A6 are unverified until the anchor check against a live Overpass runs (§6).
+- Whether a `GITHUB_TOKEN` commit counts as repository activity is unproven; the watchdog covers it.
 
 ## 10. Implementation notes (1 November 2026)
 
 The pipeline is built and tested on the two approved extracts. Where it differs from sections 0–9:
 
-- **Ireland is now a source (35 files, about 12.3 GB per run).** Tiles on the Northern Ireland border reach into Ireland, and the `united-kingdom` polygon stops at the border. Without `ireland-and-northern-ireland` (398 MB), 544 tiles of the app's UK outline are incomplete: about 270 along the land border and in the North Channel, and 272 at sea south of Jersey. With it, only the 272 sea tiles around Les Minquiers remain, all more than 10 km from Jersey's coast. The section 1 probe sampled points inside the outline, but a Find Help request needs every *tile* it touches, and those tiles cross the border. Lighting for Ireland is kept whole too, so the border tiles are complete for lighting as well. As a side effect, Find Help is local across Ireland.
+- **Ireland is now a source (35 files, about 12.3 GB per run).** Tiles on the Northern Ireland border reach into Ireland, and the `united-kingdom` polygon stops at the border. Without `ireland-and-northern-ireland` (398 MB), 544 tiles of the app's UK outline are incomplete: about 270 along the land border and in the North Channel, and 272 at sea south of Jersey. With it, 272 tiles remain (corrected in §11): sea south and east of Jersey, at least 8 km from its coast, including Les Minquiers' Maîtresse Île (an uninhabited reef with huts, land, not sea), plus two mid-Channel and two Irish Sea squares. The section 1 probe sampled points inside the outline, but a Find Help request needs every *tile* it touches, and those tiles cross the border. Lighting for Ireland is kept whole too, so the border tiles are complete for lighting as well. As a side effect, Find Help is local across Ireland.
 - **No osmium-tool and no shapely.** Neither is installed here (shapely was not approved), so extraction is pyosmium 4.3.2 alone, filtering in C++ (`KeyFilter`, `TagFilter`, `IdFilter`, `IdTracker`). Reads are one object type each, and node locations are read by id only for the nodes kept ways need. No full location index is built: the UK has about 300 M nodes, and `flex_mem` at 16 B per node, with vector doubling, would peak near the runner's 16 GB. The cost is pyosmium's `IdTracker` bitmap, about 1.2 GB whatever the file size. Coverage is my own exact integer and rational test (`pipeline/coverage.py`), not shapely.
 - **Neighbouring US state polygons overlap by only 20–100 m.** I measured this along DC's border with Maryland and Virginia. A sampling or cell-subdivision coverage test either drops every border tile or, with coarse samples, wrongly accepts gaps. `tile_covered` cuts each border tile into slabs at every edge end point, every edge-edge crossing and every edge-side crossing, and requires the polygons' inside intervals to cover the full tile width in each slab. A test with a 2-unit (0.2 m) gap and a 2-unit overlap covers this.
 - **The golden step runs twice per city.** First, packs are built from the golden extract alone and compared with margin 0: 26 DC tiles and 452 London tiles. Second, the build's real packs are compared with that extract, with a 1-tile margin because elements near the edge come from other files: 3 DC tiles (DC is small) and 334 London tiles. For London, CI downloads `greater-london` of the same day as the UK file (130 MB), instead of cutting a box with `osmium extract`. The cross check runs only when both files carry the same OSM timestamp.
 - **Unverified sentinels only warn.** Fourteen sentinels (9 London, 5 DC) are pinned by id from the test extracts and block a publish. The other 20, in other cities, are matched by name near a point and only warn until the first full build confirms them (`config/sentinels.json`).
-- **Release retention can break a backend deploy.** If the backend's pin falls more than 8 releases behind (about 8 weeks), its pinned assets are deleted, and the next Render build fails rather than falling back to Overpass. `scripts/fetch-osm-data.mjs` should treat a 404 on a pinned asset as "no packs" (Overpass, with `/health` showing `missing`), or the retention should be longer.
+- **Release retention could break a backend deploy.** Fixed in §11: releases are kept by age, and the backend's build step treats a 404 as "no packs".
 - **Smaller points.**
   - The build and pin scripts check `manifest.sanity.ok`; they do not re-run the sanity checks.
   - `tools/regions.json` is superseded by `config/regions.json`, which holds the same boxes, re-checked against `34ad0d1`.
   - Locally the packs are about 5% smaller than `tools/measure.py` reported. Only complete tiles are written; London has 452 complete tiles, against the 619 tiles it touches.
   - The full-build estimate stands at 30–60 min. Extraction took 57 ms per MB on this Mac, so allow about twice that on a 4-vCPU runner, plus the downloads.
+
+## 11. Review fixes (1 November 2026)
+
+Two reviews of the pipeline and the backend loader; what changed here:
+
+- **Data age, not release age.** The watchdog read the release's `createdAt`, which GitHub sets to the date of the commit the release points at (last week's `LATEST.json` commit), so every release looked about 7 days old when published and triggered an extra build every week. It now reads `data_as_of_epoch` from the newest release's `manifest.json`. Retention uses `publishedAt`.
+- **Schedule.** Geofabrik publishes day D's North American extracts around 16:30 UTC on D+1 (the DC file of 30 Oct was last modified 31 Oct 16:28 UTC) and Europe's by about 00:30 UTC on D+1, so a 02:17 UTC Sunday run got Friday's North American data. The build now runs Sundays at 20:17 UTC on Saturday's data; the watchdog runs every 6 hours and pins within 6 hours of a release. A healthy copy is about 1.3 days old when pinned and about 8.3 just before the next pin, so the monitor warns past **9** days (not 8) and `/health` degrades past 10. One dropped schedule run is re-dispatched once the newest data passes 8.5 days (the Monday 12:41 UTC watchdog run) and pinned that evening, when the served copy is about 9 days old: at worst a warning, never a degraded `/health`.
+- **No daily 12 GB retries.** The watchdog does not dispatch while a build is queued or running, nor within 72 hours of a failed one (it only fails red). `download.preflight()` resolves all 35 `-latest` URLs (HEAD) before any file is downloaded, so a renamed extract stops the run at once. A 429 or 503 with `Retry-After` is waited out as asked (up to 10 minutes; a longer ask fails the run), and a cut-off download resumes with a `Range` request.
+- **Retention by age.** Releases are deleted only when over 26 weeks old and outside the newest 8, so a backend pin cannot 404 because of manual re-runs or a stalled watchdog. The backend's build step also treats a 404 as "no packs" (a warning, not a failed deploy).
+- **Two jobs.** See §7.
+- **Watchdog.** Token failures no longer skip the pin step (the PAT is used only to enable and dispatch; reading and pinning use the backend's own token, the data repo being public). `gh attestation verify` adds `--source-ref refs/heads/main` and `--deny-self-hosted-runners`. A pin is refused unless its data is newer than the pinned data, its manifest names its own tag, and the pack format is 1. `data/osm-hold`, `OSM_PIN_MODE=pr` and an optional deploy hook are documented at the top of the template.
+- **The manifest names its tag** (`tag`), so an unpinned reader fetches the packs from that tag, not from `latest`, which may move between its requests. `LATEST.json` gains `data_as_of_epoch`.
+- **Strict area and reviewed-empty tiles** (`pipeline/strict.py`). The backend now never asks Overpass inside its covered regions once a pin is committed, so the sanity check fails a release unless every places tile there is complete, and fails on any lighting hole there within 2 tiles of lit streets (a hole next to streets is not open water). Two groups of tiles lie outside every extract polygon yet can hold nothing either feature returns; a reviewer listed them in `config/reviewed_empty.json` with the reason, and `pack.py` marks them complete and empty, unless any element from any extract touches one, which fails the build instead:
+  - 45 places and 102 lighting tiles of Lake Michigan off Chicago (at or east of 87.54 W, at or north of 41.76 N, at least 0.7 km offshore). Before this, a 1–1.5 km Find Help request from the South Shore lakefront touched an incomplete tile and depended on Overpass.
+  - The 272 places tiles of the UK outline above (Find Help only; they stay incomplete for lighting, where the backend answers null).
+
+  `tools/strict_area.py` writes the strict area as the backend commits it.
+- **Corrections to §10:** the nearest UK-outline hole is at least 8 km from Jersey's coast (not "more than 10 km"), and Les Minquiers' Maîtresse Île tile is land, not sea. `config/uk_outline.json` now carries a `_licence` field (ODbL), since the repository's root `LICENSE` (MIT) covers the code only.
+- **Not done:** the live anchor check against a real Overpass (§6; A1–A6 remain assumptions shared by the packer, the golden check and the backend's tests), and the stale-element case between overlapping extracts (`store.py` keeps the higher version of an element that still matches in one file; an element that stopped matching in a newer overlapping file survives from the older one, at most the day of skew between Geofabrik's files, inside data that is a week old anyway).
+

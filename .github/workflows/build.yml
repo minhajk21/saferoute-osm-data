@@ -1,30 +1,44 @@
 # Weekly build of lighting.pack and places.pack from Geofabrik extracts
 # (DESIGN.md section 4). Publishes a GitHub Release with the packs, the
 # manifest, ATTRIBUTION.txt and LICENSE-DATA.md, attests their provenance,
-# commits LATEST.json (the keepalive) and keeps the newest 8 releases.
+# commits LATEST.json (the keepalive) and deletes releases only once they
+# are both over 26 weeks old and outside the newest 8.
+#
+# Two jobs, so the code that parses 12 GB of downloaded files never holds a
+# write token (DESIGN.md section 7):
+#   build    read-only (contents: read, no stored git credentials, no token in
+#            the build step): downloads, extracts, packs, runs the golden and
+#            sanity checks, and hands dist/ on as a workflow artifact.
+#   publish  never reads a .pbf: attests the artifact's files, publishes the
+#            release, commits LATEST.json and prunes old releases.
 #
 # GitHub disables a public repository's schedule after 60 days without
 # repository activity. Three guards, none of which can stop silently on its
 # own (DESIGN.md section 4):
 #   (a) every successful run commits LATEST.json to the default branch;
-#   (b) the private backend repository runs a daily watchdog
+#   (b) the private backend repository runs a watchdog every 6 hours
 #       (contrib/backend-osm-data-watchdog.yml) that re-enables this workflow
-#       and dispatches it when the newest release is over 8 days old, and
-#       fails (red) whenever it had to;
-#   (c) the backend's /health and monitor alert on data age (> 8 days warn,
+#       and dispatches it when the newest release's DATA is over 8.5 days old,
+#       and fails (red) whenever it had to;
+#   (c) the backend's /health and monitor alert on data age (> 9 days warn,
 #       > 10 days critical) even if (a) and (b) both stop.
 name: build
 
 on:
   schedule:
-    - cron: '17 2 * * 0'     # Sundays 02:17 UTC, after Geofabrik's daily run (~21:00 CET)
+    # Sundays 20:17 UTC. Geofabrik publishes day D's North America extracts
+    # around 16:30 UTC on D+1 (31 Oct 2026: the DC file of 30 Oct was last
+    # modified 31 Oct 16:28 UTC) and Europe's by about 00:30 UTC on D+1, so
+    # at this hour every extract has Saturday's data. At 02:17 UTC the North
+    # American files were still Friday's.
+    - cron: '17 20 * * 0'
   workflow_dispatch:
     inputs:
       allow_count_change:
         description: >-
           Publish even if a region or source count moved past -10%/+25% against the
-          previous release. Golden, sentinel and coverage checks still apply. Only after
-          looking at why the count moved.
+          previous release. Golden, sentinel, coverage and strict-area checks still apply.
+          Only after looking at why the count moved.
         type: boolean
         default: false
 
@@ -39,14 +53,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     permissions:
-      contents: write        # release, LATEST.json commit
-      id-token: write        # attestation (Sigstore)
-      attestations: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      ALLOW_COUNT_CHANGE: ${{ inputs.allow_count_change }}
+      contents: read
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -64,6 +77,8 @@ jobs:
           free -m
 
       - name: Previous release manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p "$RUNNER_TEMP/prev"
           if gh release view --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -73,20 +88,30 @@ jobs:
           fi
 
       - name: Choose the tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           tag="data-$(date -u +%F)"
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             tag="$tag-r$GITHUB_RUN_NUMBER"
           fi
           echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-      - name: Build (download one extract at a time, extract, pack, golden, sanity)
+      # No token in this step's environment and no git credentials on disk:
+      # libosmium parses untrusted downloads here.
+      - name: Build (preflight every extract, then download one at a time, extract, pack, golden, sanity)
+        env:
+          ALLOW_COUNT_CHANGE: ${{ inputs.allow_count_change }}
         run: |
           extra=()
           if [ "$ALLOW_COUNT_CHANGE" = "true" ]; then extra+=(--allow-count-change); fi
           python -I pipeline/build.py --sources config/sources.json --regions config/regions.json \
             --work "$RUNNER_TEMP/work" --out dist --previous "$RUNNER_TEMP/prev/manifest.json" \
             --tag "$TAG" "${extra[@]}"
+          mkdir -p dist-meta
+          cp "$RUNNER_TEMP/work/LATEST.json" "$RUNNER_TEMP/work/RELEASE_NOTES.md" "$RUNNER_TEMP/work/build-report.json" dist-meta/
 
       - name: Report
         if: always()
@@ -110,23 +135,77 @@ jobs:
           EOF
           cat "$RUNNER_TEMP/work/build-report.json" || true
 
+      - name: Hand the packs to the publish job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: |
+            dist/lighting.pack
+            dist/places.pack
+            dist/manifest.json
+            dist/ATTRIBUTION.txt
+            dist/LICENSE-DATA.md
+            dist-meta/LATEST.json
+            dist-meta/RELEASE_NOTES.md
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write        # release, LATEST.json commit
+      id-token: write        # attestation (Sigstore)
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.build.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: release
+
+      - name: Check the hand-over
+        run: |
+          set -euo pipefail
+          test -n "$TAG"
+          python3 -I - release <<'EOF'
+          import hashlib, json, os, sys
+          d = sys.argv[1]
+          man = json.load(open(os.path.join(d, 'dist', 'manifest.json')))
+          if not man['sanity']['ok']:
+              sys.exit('the manifest says the sanity checks failed')
+          for name, want in man['assets'].items():
+              data = open(os.path.join(d, 'dist', name), 'rb').read()
+              if len(data) != want['bytes'] or hashlib.sha256(data).hexdigest() != want['sha256']:
+                  sys.exit(f'{name} does not match the manifest')
+          if man.get('tag') != os.environ['TAG']:
+              sys.exit(f"manifest tag {man.get('tag')} is not {os.environ['TAG']}")
+          print('hand-over verified')
+          EOF
+
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
-            dist/lighting.pack
-            dist/places.pack
-            dist/manifest.json
+            release/dist/lighting.pack
+            release/dist/places.pack
+            release/dist/manifest.json
 
       - name: Publish the release
         run: |
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --title "OSM data $TAG" --notes-file "$RUNNER_TEMP/work/RELEASE_NOTES.md" \
-            dist/lighting.pack dist/places.pack dist/manifest.json dist/ATTRIBUTION.txt dist/LICENSE-DATA.md
+            --title "OSM data $TAG" --notes-file release/dist-meta/RELEASE_NOTES.md \
+            release/dist/lighting.pack release/dist/places.pack release/dist/manifest.json \
+            release/dist/ATTRIBUTION.txt release/dist/LICENSE-DATA.md
 
       - name: Keepalive commit (LATEST.json)
         run: |
-          cp "$RUNNER_TEMP/work/LATEST.json" LATEST.json
+          cp release/dist-meta/LATEST.json LATEST.json
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add LATEST.json
@@ -134,10 +213,17 @@ jobs:
           git pull --rebase origin "$GITHUB_REF_NAME"
           git push origin "HEAD:$GITHUB_REF_NAME"
 
-      - name: Keep the newest 8 releases
+      # By age, not count: a backend pin stays downloadable for 26 weeks
+      # however many releases manual re-runs add, and its data is long past
+      # the backend's 30-day expiry by then. The newest 8 are always kept.
+      # publishedAt, not createdAt: GitHub sets createdAt to the date of the
+      # commit the release points at (usually last week's LATEST.json commit).
+      - name: Delete releases over 26 weeks old (never the newest 8)
         run: |
-          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,createdAt \
-            --jq '[.[] | select(.tagName | startswith("data-"))] | sort_by(.createdAt) | reverse | .[8:] | .[].tagName' |
+          cutoff=$(date -u -d '182 days ago' +%Y-%m-%dT%H:%M:%SZ)
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName,publishedAt \
+            --jq "[.[] | select(.tagName | startswith(\"data-\"))] | sort_by(.publishedAt) | reverse | .[8:]
+                  | .[] | select(.publishedAt < \"$cutoff\") | .tagName" |
           while read -r old; do
             echo "deleting $old"
             gh release delete "$old" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag

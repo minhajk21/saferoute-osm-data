@@ -15,10 +15,21 @@ Usage:
    missing, older than --previous-timestamp or more than --max-age-days old.
 Prints a JSON record (url, dated_url, bytes, md5, sha256, timestamp, path).
 Redirects may only stay on the same host. User-Agent per config/sources.json.
+
+Politeness (a failing build must not cost Geofabrik a full re-download):
+  - build.py calls preflight() first: every -latest URL is resolved (HEAD,
+    no body) before ANY file is downloaded, so a renamed or missing extract
+    stops the run at once, not after gigabytes of earlier files.
+  - A 429 or 503 with Retry-After is waited out as asked (capped at
+    MAX_RETRY_AFTER_S); otherwise retries wait RETRY_DELAY_S, then twice that.
+  - A download cut off part-way resumes with a Range request for the rest
+    (the part already on disk is re-hashed first, so both hashes still cover
+    the whole file); a server that ignores Range sends it all again.
 """
 import argparse
 import datetime as dt
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -35,6 +46,7 @@ USER_AGENT = 'SafeRoute/1.0 (https://safe-route.app; minhaj@safe-route.app)'
 CHUNK = 1 << 20
 RETRIES = 3
 RETRY_DELAY_S = 10      # tests set 0
+MAX_RETRY_AFTER_S = 600
 
 
 class DownloadError(RuntimeError):
@@ -52,19 +64,46 @@ def _open(url, method='GET', follow=True, timeout=60):
     return opener.open(req, timeout=timeout)
 
 
+def retry_after_s(headers, now=None):
+    """Seconds a Retry-After header asks for (delta-seconds or an HTTP date), or None."""
+    v = (headers or {}).get('Retry-After') if headers is not None else None
+    if not v:
+        return None
+    v = v.strip()
+    if v.isdigit():
+        return int(v)
+    try:
+        import email.utils
+        when = email.utils.parsedate_to_datetime(v)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=dt.timezone.utc)
+    now = now or dt.datetime.now(dt.timezone.utc)
+    return max(0, int((when - now).total_seconds()))
+
+
 def _retry(fn, what):
     last = None
     for attempt in range(RETRIES):
+        wait = RETRY_DELAY_S * (attempt + 1)
         try:
             return fn()
         except urllib.error.HTTPError as e:
             if e.code < 500 and e.code != 429:
                 raise DownloadError(f'{what}: HTTP {e.code}') from e
             last = e
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            asked = retry_after_s(e.headers) if e.code in (429, 503) else None
+            if asked is not None:
+                if asked > MAX_RETRY_AFTER_S:
+                    raise DownloadError(f'{what}: HTTP {e.code}, Retry-After {asked} s (more than we wait)') from e
+                wait = max(wait, asked)
+        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as e:
             last = e
         if attempt + 1 < RETRIES:
-            time.sleep(RETRY_DELAY_S * (attempt + 1))
+            time.sleep(wait)
     raise DownloadError(f'{what}: {last}')
 
 
@@ -110,27 +149,70 @@ def fetch_text(url, limit=1 << 16):
     return data.decode('utf-8', 'replace')
 
 
+def _hash_existing(path):
+    md5, sha = hashlib.md5(), hashlib.sha256()
+    n = 0
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(CHUNK), b''):
+            md5.update(chunk)
+            sha.update(chunk)
+            n += len(chunk)
+    return n, md5, sha
+
+
 def fetch_file(url, dest):
-    """Stream url to dest; returns (bytes, md5, sha256)."""
+    """Stream url to dest; returns (bytes, md5, sha256). A retry after a cut-off
+    transfer asks only for the missing bytes (Range), when the server allows."""
+    tmp = dest + '.part'
+    if os.path.exists(tmp):
+        os.remove(tmp)            # never resume a part left by another run
+
     def get():
-        md5, sha = hashlib.md5(), hashlib.sha256()
-        n = 0
-        tmp = dest + '.part'
-        with _open(url, timeout=120) as r, open(tmp, 'wb') as f:
-            while True:
-                chunk = r.read(CHUNK)
-                if not chunk:
-                    break
-                f.write(chunk)
-                md5.update(chunk)
-                sha.update(chunk)
-                n += len(chunk)
-            expected = r.headers.get('Content-Length')
-        if expected is not None and int(expected) != n:
+        have = os.path.getsize(tmp) if os.path.exists(tmp) else 0
+        req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
+        if have:
+            req.add_header('Range', f'bytes={have}-')
+        try:
+            r = urllib.request.build_opener().open(req, timeout=120)
+        except urllib.error.HTTPError as e:
+            if e.code == 416 and have:
+                os.remove(tmp)    # the part is not a prefix we can extend: start again
+                raise ConnectionError('range not satisfiable; restarting the download') from e
+            raise
+        with r:
+            resumed = have > 0 and r.status == 206 and \
+                (r.headers.get('Content-Range') or '').startswith(f'bytes {have}-')
+            if r.status == 206 and not resumed:
+                raise ConnectionError(f"partial content we did not ask for ({r.headers.get('Content-Range')})")
+            if resumed:
+                n, md5, sha = _hash_existing(tmp)
+                total = (r.headers.get('Content-Range') or '').rpartition('/')[2]
+                expected = int(total) if total.isdigit() else None
+                mode = 'ab'
+            else:
+                n, md5, sha = 0, hashlib.md5(), hashlib.sha256()
+                cl = r.headers.get('Content-Length')
+                expected = int(cl) if cl is not None and r.status == 200 else None
+                mode = 'wb'
+            with open(tmp, mode) as f:
+                while True:
+                    chunk = r.read(CHUNK)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    md5.update(chunk)
+                    sha.update(chunk)
+                    n += len(chunk)
+        if expected is not None and expected != n:
             raise ConnectionError(f'short read: {n} of {expected} bytes')
         os.replace(tmp, dest)
         return n, md5.hexdigest(), sha.hexdigest()
-    return _retry(get, f'GET {url}')
+    try:
+        return _retry(get, f'GET {url}')
+    except DownloadError:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
 
 
 def file_timestamp(path):
@@ -156,9 +238,23 @@ def check_timestamp(stamp, previous=None, max_age_days=7, now=None):
         raise DownloadError(f'data timestamp {stamp} is in the future')
 
 
-def download(latest_url, dest_dir, previous=None, max_age_days=7, date=None, now=None):
+def preflight(urls):
+    """{-latest URL: dated URL} for every URL, resolved before anything is
+    downloaded. Raises DownloadError naming EVERY URL that did not resolve."""
+    out, bad = {}, []
+    for url in urls:
+        try:
+            out[url] = resolve_dated(url)
+        except DownloadError as e:
+            bad.append(str(e))
+    if bad:
+        raise DownloadError(f'{len(bad)} of {len(urls)} extracts did not resolve, nothing downloaded: ' + '; '.join(bad))
+    return out
+
+
+def download(latest_url, dest_dir, previous=None, max_age_days=7, date=None, now=None, dated=None):
     os.makedirs(dest_dir, exist_ok=True)
-    dated = resolve_dated(latest_url, date)
+    dated = dated or resolve_dated(latest_url, date)
     name = os.path.basename(urllib.parse.urlsplit(dated).path)
     md5_text = fetch_text(dated + '.md5')
     m = re.match(r'\s*([0-9a-f]{32})\b', md5_text)

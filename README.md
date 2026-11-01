@@ -31,36 +31,48 @@ city boxes in [`config/regions.json`](config/regions.json).
 
 ## How the weekly build runs
 
-[`.github/workflows/build.yml`](.github/workflows/build.yml) runs on Sundays at 02:17 UTC and on manual dispatch:
+[`.github/workflows/build.yml`](.github/workflows/build.yml) runs on Sundays at 20:17 UTC (when Geofabrik
+has Saturday's files for every region, North America included) and on manual dispatch. Its `build` job is
+read-only (no write token, no stored git credentials) and:
 
 1. installs pyosmium from hash-pinned wheels and runs the unit tests;
-2. downloads each extract **one at a time** (the `-latest` URL's redirect gives the dated file; its MD5 must
-   match Geofabrik's `.md5`; its OSM timestamp must be under 7 days old and not older than the previous
-   release's), adds it to a SQLite store, and deletes it;
+2. resolves every extract's `-latest` URL first (HEAD only), so a missing one stops the run before anything
+   is downloaded; then downloads each extract **one at a time** (the redirect gives the dated file; its MD5
+   must match Geofabrik's `.md5`; its OSM timestamp must be under 7 days old and not older than the previous
+   release's; `Retry-After` is honoured and a cut-off transfer resumes with `Range`), adds it to a SQLite
+   store, and deletes it;
 3. merges the store into the two packs;
 4. **golden step**: a brute-force emulator of the Overpass path ([`pipeline/golden.py`](pipeline/golden.py),
    which shares no code with the packer) recomputes every tile of DC and of Greater London from the raw
    extracts and must match the packs exactly;
 5. **sanity checks** against the previous release: counts per region and per source within −10%/+25%,
-   [sentinel places](config/sentinels.json) present, and no incomplete tile except the open water listed in
-   [`config/known_incomplete.json`](config/known_incomplete.json) (city boxes and the app's UK outline);
-6. attests the packs and manifest (GitHub artifact attestation), publishes a release `data-YYYY-MM-DD`,
-   commits `LATEST.json` and keeps the newest 8 releases.
+   [sentinel places](config/sentinels.json) present, no incomplete tile except those listed in
+   [`config/known_incomplete.json`](config/known_incomplete.json) (city boxes and the app's UK outline), and
+   **every places tile of the strict area complete** (the backend's covered regions, where it never asks
+   Overpass: [`pipeline/strict.py`](pipeline/strict.py)). Open water outside every extract polygon is made
+   complete only where a person reviewed it ([`config/reviewed_empty.json`](config/reviewed_empty.json)) and
+   no element touches it.
+
+A separate `publish` job, which never reads a `.pbf`, re-checks the hand-over against the manifest, attests
+the packs and manifest (GitHub artifact attestation), publishes a release `data-YYYY-MM-DD`, commits
+`LATEST.json` and deletes releases only once they are over 26 weeks old and outside the newest 8.
 
 Any failure in 2–5 stops the publish; the previous release stays current. `manifest.json` holds every
 source's URL, size, MD5, SHA-256 and OSM timestamp, every asset's size, SHA-256 and counts, the tool
 versions, the build commit, and `data_as_of` (the **oldest** source timestamp).
 
 **The schedule cannot stop unnoticed.** GitHub disables a public repo's schedule after 60 days without
-activity. The weekly `LATEST.json` commit is activity; the backend repo runs a daily watchdog
+activity. The weekly `LATEST.json` commit is activity; the backend repo runs a watchdog every 6 hours
 ([`contrib/backend-osm-data-watchdog.yml`](contrib/backend-osm-data-watchdog.yml), a template to copy there)
-that re-enables and dispatches this workflow and fails when it had to; and the backend's `/health` and
-monitor alert on data age whatever happens here.
+that re-enables this workflow, dispatches it when the newest release's data is over 8.5 days old (but not
+again within 72 hours of a failed build), and fails when it had to; and the backend's `/health` and monitor
+alert on data age (warning past 9 days, critical past 10) whatever happens here.
 
 **Trust.** The checks catch corrupt downloads, an asset swapped after the backend pinned it (the backend
 re-checks its own pinned SHA-256), an asset this workflow did not build (attestation), a broken build (golden,
 sentinels, counts) and stale data. They do not catch a malicious OSM edit, a compromised GitHub account or
-workflow, or Geofabrik serving altered data with a matching MD5. DESIGN.md section 7 has the full model.
+workflow, or Geofabrik serving altered data with a matching MD5. Nobody reviews a release before the
+backend's watchdog pins it, unless the backend sets `OSM_PIN_MODE=pr`. DESIGN.md section 7 has the full model.
 
 ## Run it locally
 
@@ -96,7 +108,9 @@ OSM_TEST_DATA=/path/to/data OSM_TEST_LONDON=1 /path/to/venv/bin/python -I -m uni
 The second form adds the golden checks on the real DC and Greater London extracts.
 
 After changing `config/sources.json` or `config/regions.json`, regenerate the known holes and review the diff:
-`python -I tools/known_incomplete.py /path/to/index-v1.json`.
+`python -I tools/known_incomplete.py /path/to/index-v1.json`. Then regenerate the backend's strict area and commit it
+there as `data/osm-strict-area.json` (the backend's tests check every provider's box against it):
+`python -I tools/strict_area.py /path/to/saferoute-backend/data/osm-strict-area.json`.
 
 ## Measured (31 Oct 2026, Apple M-series laptop, the two test extracts)
 
@@ -118,8 +132,8 @@ The full 35-file run has not been measured; DESIGN.md section 10 has the estimat
 
 ```
 pipeline/   download, extract, store, coverage, pack, packfmt, golden, sanity, manifest, build
-config/     sources, regions, sentinels, known_incomplete, uk_outline, sources.local (test)
-tools/      design probes and known_incomplete.py
+config/     sources, regions, sentinels, known_incomplete, reviewed_empty, uk_outline, sources.local (test)
+tools/      design probes, known_incomplete.py, strict_area.py
 tests/      unit, synthetic end-to-end, download (local server), real-extract golden tests
 contrib/    the backend repo's daily watchdog (template)
 ```
