@@ -1,0 +1,29 @@
+{
+ "assets": {
+  "ATTRIBUTION.txt": {
+   "bytes": 429,
+   "sha256": "a10ba7532d11c19def432deeed2cfbb712718611f9496be1d07224d37a0d9d62"
+  },
+  "LICENSE-DATA.md": {
+   "bytes": 1474,
+   "sha256": "bea6792fc1a68cb4bb3905c3039fd36a31ff97d26009363b428382c71dd640fb"
+  },
+  "lighting.pack": {
+   "bytes": 67516216,
+   "sha256": "286eb29a9a87d8b501ffa59b4d55e3735fffbb6845a32ac9b9d17f3e8fc17f8f"
+  },
+  "places.pack": {
+   "bytes": 9919247,
+   "sha256": "5d66e48f31d03d7b7c6f44d5eb82dca38eb7d79af36554fb2762b76745e7745b"
+  }
+ },
+ "built_at": "2026-11-01T16:56:31Z",
+ "counts": {
+  "lit_ways": 1533953,
+  "places": 72726
+ },
+ "data_as_of": "2026-10-31T21:23:06Z",
+ "data_as_of_epoch": 1793481786,
+ "manifest_sha256": "c2d822601a7366295d3919691b7c3512d114b58ecf203f4d3c2284ae9607e684",
+ "tag": "data-2026-11-01"
+}
