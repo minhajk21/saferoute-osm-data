@@ -1,0 +1,120 @@
+# TEMPLATE for the PRIVATE backend repository (minhajk21/saferoute-backend),
+# to be copied to .github/workflows/osm-data.yml there (DESIGN.md sections 4
+# and 5). It does nothing in this repository: GitHub only runs workflows under
+# .github/workflows/. Untested until it runs there.
+#
+# Needs, in the backend repository:
+#   secret OSM_DATA_TOKEN  fine-grained PAT, repository minhajk21/saferoute-osm-data
+#                          only, permission Actions: read and write (and
+#                          Contents: read). It expires: the data-age alert on
+#                          /health is the guard that still fires if it does.
+#   data/osm-manifest.json the pinned release (written by this workflow).
+#
+# Daily:
+#   1. If the data repo's build workflow is not `active` (GitHub's 60-day
+#      rule, or someone disabled it): enable it, dispatch it, and FAIL.
+#   2. If the newest release is more than 8 days old: dispatch a build and
+#      FAIL (a red run is the point: someone should look).
+#   3. If a newer release than the pinned one exists: verify its provenance
+#      attestation (signer workflow = the data repo's build.yml), re-hash
+#      every asset against its manifest, require manifest.sanity.ok, then
+#      commit the new pin to main. Render auto-deploys on that commit (or use
+#      the deploy hook if a GITHUB_TOKEN push does not trigger it).
+name: osm-data
+
+on:
+  schedule:
+    - cron: '41 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: osm-data
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      DATA_REPO: minhajk21/saferoute-osm-data
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Is the weekly build alive?
+        env:
+          GH_TOKEN: ${{ secrets.OSM_DATA_TOKEN }}
+        run: |
+          problem=0
+          state=$(gh api "repos/$DATA_REPO/actions/workflows/build.yml" --jq .state)
+          echo "build.yml state: $state"
+          if [ "$state" != "active" ]; then
+            gh workflow enable build.yml --repo "$DATA_REPO"
+            gh workflow run build.yml --repo "$DATA_REPO"
+            echo "::error::build.yml was $state: re-enabled and dispatched"
+            problem=1
+          fi
+          created=$(gh release view --repo "$DATA_REPO" --json createdAt --jq .createdAt || echo "")
+          if [ -z "$created" ]; then
+            echo "::error::no release in $DATA_REPO"
+            problem=1
+          else
+            age=$(( ( $(date -u +%s) - $(date -u -d "$created" +%s) ) / 86400 ))
+            echo "newest release is $age days old ($created)"
+            if [ "$age" -gt 8 ]; then
+              gh workflow run build.yml --repo "$DATA_REPO"
+              echo "::error::newest release is $age days old: dispatched a build"
+              problem=1
+            fi
+          fi
+          echo "PROBLEM=$problem" >> "$GITHUB_ENV"
+
+      - name: Pin a newer release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=$(gh release view --repo "$DATA_REPO" --json tagName --jq .tagName)
+          pinned=$(python3 -I -c "import json; print(json.load(open('data/osm-manifest.json'))['tag'])" 2>/dev/null || echo none)
+          echo "newest $tag, pinned $pinned"
+          if [ "$tag" = "$pinned" ]; then exit 0; fi
+          d=$(mktemp -d)
+          gh release download "$tag" --repo "$DATA_REPO" --dir "$d" \
+            --pattern manifest.json --pattern lighting.pack --pattern places.pack
+          for f in manifest.json lighting.pack places.pack; do
+            gh attestation verify "$d/$f" --repo "$DATA_REPO" \
+              --signer-workflow "$DATA_REPO/.github/workflows/build.yml"
+          done
+          python3 -I - "$d" "$tag" <<'EOF'
+          import hashlib, json, os, sys
+          d, tag = sys.argv[1], sys.argv[2]
+          man = json.load(open(os.path.join(d, 'manifest.json')))
+          if not man['sanity']['ok']:
+              sys.exit('the release says its sanity checks failed')
+          pin = {'tag': tag, 'data_as_of': man['data_as_of'], 'built_at': man['built_at'],
+                 'manifest_sha256': hashlib.sha256(open(os.path.join(d, 'manifest.json'), 'rb').read()).hexdigest(),
+                 'assets': {}}
+          for name in ('lighting.pack', 'places.pack'):
+              data = open(os.path.join(d, name), 'rb').read()
+              want = man['assets'][name]
+              got = hashlib.sha256(data).hexdigest()
+              if got != want['sha256'] or len(data) != want['bytes']:
+                  sys.exit(f'{name}: {got}/{len(data)} does not match the manifest')
+              pin['assets'][name] = {'bytes': want['bytes'], 'sha256': want['sha256'],
+                                     'url': f'https://github.com/minhajk21/saferoute-osm-data/releases/download/{tag}/{name}'}
+          os.makedirs('data', exist_ok=True)
+          with open('data/osm-manifest.json', 'w') as f:
+              json.dump(pin, f, indent=1, sort_keys=True)
+              f.write('\n')
+          EOF
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add data/osm-manifest.json
+          git commit -m "osm-data: pin $tag" -m "Attestation verified against $DATA_REPO build.yml; sizes and SHA-256 match its manifest."
+          git push origin HEAD:main
+
+      - name: Fail when the build needed help
+        if: env.PROBLEM == '1'
+        run: exit 1

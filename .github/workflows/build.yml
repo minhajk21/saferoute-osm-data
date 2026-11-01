@@ -1,0 +1,144 @@
+# Weekly build of lighting.pack and places.pack from Geofabrik extracts
+# (DESIGN.md section 4). Publishes a GitHub Release with the packs, the
+# manifest, ATTRIBUTION.txt and LICENSE-DATA.md, attests their provenance,
+# commits LATEST.json (the keepalive) and keeps the newest 8 releases.
+#
+# GitHub disables a public repository's schedule after 60 days without
+# repository activity. Three guards, none of which can stop silently on its
+# own (DESIGN.md section 4):
+#   (a) every successful run commits LATEST.json to the default branch;
+#   (b) the private backend repository runs a daily watchdog
+#       (contrib/backend-osm-data-watchdog.yml) that re-enables this workflow
+#       and dispatches it when the newest release is over 8 days old, and
+#       fails (red) whenever it had to;
+#   (c) the backend's /health and monitor alert on data age (> 8 days warn,
+#       > 10 days critical) even if (a) and (b) both stop.
+name: build
+
+on:
+  schedule:
+    - cron: '17 2 * * 0'     # Sundays 02:17 UTC, after Geofabrik's daily run (~21:00 CET)
+  workflow_dispatch:
+    inputs:
+      allow_count_change:
+        description: >-
+          Publish even if a region or source count moved past -10%/+25% against the
+          previous release. Golden, sentinel and coverage checks still apply. Only after
+          looking at why the count moved.
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    permissions:
+      contents: write        # release, LATEST.json commit
+      id-token: write        # attestation (Sigstore)
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ALLOW_COUNT_CHANGE: ${{ inputs.allow_count_change }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install pyosmium (hash-pinned)
+        run: python -m pip install --require-hashes --no-deps -r requirements.lock
+
+      - name: Unit tests
+        run: python -I -m unittest discover -s tests -t .
+
+      - name: Disk and memory
+        run: |
+          df -h "$RUNNER_TEMP" .
+          free -m
+
+      - name: Previous release manifest
+        run: |
+          mkdir -p "$RUNNER_TEMP/prev"
+          if gh release view --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release download --repo "$GITHUB_REPOSITORY" --pattern manifest.json --dir "$RUNNER_TEMP/prev"
+          else
+            echo "No previous release: first build, count checks are skipped."
+          fi
+
+      - name: Choose the tag
+        run: |
+          tag="data-$(date -u +%F)"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            tag="$tag-r$GITHUB_RUN_NUMBER"
+          fi
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+
+      - name: Build (download one extract at a time, extract, pack, golden, sanity)
+        run: |
+          extra=()
+          if [ "$ALLOW_COUNT_CHANGE" = "true" ]; then extra+=(--allow-count-change); fi
+          python -I pipeline/build.py --sources config/sources.json --regions config/regions.json \
+            --work "$RUNNER_TEMP/work" --out dist --previous "$RUNNER_TEMP/prev/manifest.json" \
+            --tag "$TAG" "${extra[@]}"
+
+      - name: Report
+        if: always()
+        run: |
+          python -I - "$RUNNER_TEMP/work/build-report.json" >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          import json, sys
+          try:
+              r = json.load(open(sys.argv[1]))
+          except OSError:
+              print('No build report (the build stopped before writing it).')
+              sys.exit(0)
+          print(f"### {r['tag']}: {'OK' if r['ok'] else 'FAILED'}")
+          print(f"peak RSS {r['timings'].get('peak_rss_mb')} MB, total {r['timings'].get('total_s')} s")
+          for e in r['sanity'].get('errors', []):
+              print(f'- ERROR {e}')
+          for w in r['sanity'].get('warnings', []):
+              print(f'- warning {w}')
+          for name, res in r['golden'].items():
+              for mode, g in res.items():
+                  print(f"- golden {name}/{mode}: ok={g['ok']} tiles={g['domain_tiles']} failures={g['failure_count']}")
+          EOF
+          cat "$RUNNER_TEMP/work/build-report.json" || true
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/lighting.pack
+            dist/places.pack
+            dist/manifest.json
+
+      - name: Publish the release
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "OSM data $TAG" --notes-file "$RUNNER_TEMP/work/RELEASE_NOTES.md" \
+            dist/lighting.pack dist/places.pack dist/manifest.json dist/ATTRIBUTION.txt dist/LICENSE-DATA.md
+
+      - name: Keepalive commit (LATEST.json)
+        run: |
+          cp "$RUNNER_TEMP/work/LATEST.json" LATEST.json
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add LATEST.json
+          git commit -m "data: $TAG" -m "Weekly build record. This commit is also the repository activity that keeps the weekly schedule enabled."
+          git pull --rebase origin "$GITHUB_REF_NAME"
+          git push origin "HEAD:$GITHUB_REF_NAME"
+
+      - name: Keep the newest 8 releases
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,createdAt \
+            --jq '[.[] | select(.tagName | startswith("data-"))] | sort_by(.createdAt) | reverse | .[8:] | .[].tagName' |
+          while read -r old; do
+            echo "deleting $old"
+            gh release delete "$old" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          done

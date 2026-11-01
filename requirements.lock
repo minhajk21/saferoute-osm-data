@@ -1,0 +1,8 @@
+# pip install --require-hashes --no-deps -r requirements.lock
+# osmium 4.3.2 (pyosmium, BSD-2-Clause), CPython 3.12 wheels, SHA-256 from
+# https://pypi.org/pypi/osmium/4.3.2/json (fetched 31 Oct 2026).
+osmium==4.3.2 \
+    --hash=sha256:604a3145aa755790b91e3eefac7ddbb74d31f188fddbbbb988877cba50e88eb7 \
+    --hash=sha256:fb7ac18aba1b3913904c34993a40086e4fa56e9f4debe84c9f5a1caeddc550d4 \
+    --hash=sha256:ae66a318b8a9ee2463979264156ca4e98713c369e26ff5e3622b177a05073fc1 \
+    --hash=sha256:ff11a2d870c2ec345d834550afd3227716404180444410b5db122f89c9efcd77

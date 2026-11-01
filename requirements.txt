@@ -1,0 +1,4 @@
+# Runtime dependency of pipeline/ (everything else is the Python 3.12 standard library).
+# pyosmium's own dependency `requests` is only used by osmium.replication, which this
+# repository does not import, so CI installs with --no-deps from requirements.lock.
+osmium==4.3.2

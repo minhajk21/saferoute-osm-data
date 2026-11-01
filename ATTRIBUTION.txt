@@ -1,0 +1,5 @@
+© OpenStreetMap contributors. Data under the Open Database License 1.0, from Geofabrik extracts (download.geofabrik.de).
+
+lighting.pack and places.pack contain data from OpenStreetMap (https://www.openstreetmap.org/copyright),
+selected and re-encoded by the scripts at https://github.com/minhajk21/saferoute-osm-data. They are made
+available under the Open Database License 1.0 (https://opendatacommons.org/licenses/odbl/1-0/).

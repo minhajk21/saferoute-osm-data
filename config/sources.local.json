@@ -1,0 +1,13 @@
+{
+  "_comment": "Local test build: the two extracts approved for download to the owner's Mac (31 Oct 2026). Same rules as sources.json; run with --local ID=PATH for both and --partial.",
+  "user_agent": "SafeRoute/1.0 (https://safe-route.app; minhaj@safe-route.app)",
+  "index_url": "https://download.geofabrik.de/index-v1.json",
+  "golden": [
+    {"name": "dc", "source": "us/district-of-columbia", "margin_tiles": 1},
+    {"name": "london", "source": "greater-london", "margin_tiles": 1}
+  ],
+  "sources": [
+    {"id": "us/district-of-columbia", "url": "https://download.geofabrik.de/north-america/us/district-of-columbia-latest.osm.pbf", "lighting": "boxes"},
+    {"id": "greater-london", "url": "https://download.geofabrik.de/europe/united-kingdom/england/greater-london-latest.osm.pbf", "lighting": "whole"}
+  ]
+}
