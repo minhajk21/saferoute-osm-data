@@ -10,20 +10,20 @@
   },
   "lighting.pack": {
    "bytes": 67516216,
-   "sha256": "286eb29a9a87d8b501ffa59b4d55e3735fffbb6845a32ac9b9d17f3e8fc17f8f"
+   "sha256": "959ea87d89836836968ec9515f7a227a9d2bf0a6ed16c2dae91059eb356e3916"
   },
   "places.pack": {
    "bytes": 9919247,
-   "sha256": "5d66e48f31d03d7b7c6f44d5eb82dca38eb7d79af36554fb2762b76745e7745b"
+   "sha256": "b162e9d36bad82d9972252671ce256ab57da28f1da3f50983f3ff97c3d781a60"
   }
  },
- "built_at": "2026-11-01T16:56:31Z",
+ "built_at": "2026-11-02T00:19:58Z",
  "counts": {
   "lit_ways": 1533953,
   "places": 72726
  },
  "data_as_of": "2026-10-31T21:23:06Z",
  "data_as_of_epoch": 1793481786,
- "manifest_sha256": "c2d822601a7366295d3919691b7c3512d114b58ecf203f4d3c2284ae9607e684",
- "tag": "data-2026-11-01"
+ "manifest_sha256": "79b529eb3bf05cb88beac21355c9f39d7d23429135806fdcb3cd496baedbd1c9",
+ "tag": "data-2026-11-01-r2"
 }
