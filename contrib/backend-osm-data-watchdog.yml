@@ -1,7 +1,12 @@
 # TEMPLATE for the PRIVATE backend repository (minhajk21/saferoute-backend),
 # to be copied to .github/workflows/osm-data.yml there (DESIGN.md sections 4
 # and 5). It does nothing in this repository: GitHub only runs workflows under
-# .github/workflows/. Untested until it runs there.
+# .github/workflows/. Installed there on 3 November 2026, with two fixes made in
+# both copies the same day: the build's state is read with the backend's own
+# token (this repo is public), so OSM_DATA_TOKEN is needed only to re-enable or
+# dispatch the build; and a newest release whose data is not newer than the pin
+# (a rebuild of the same extracts, like data-2026-11-01-r2) is a notice, not a
+# failure, checked from its manifest before the packs are downloaded.
 #
 # Needs, in the backend repository:
 #   secret OSM_DATA_TOKEN  fine-grained PAT, repository minhajk21/saferoute-osm-data
@@ -91,10 +96,13 @@ jobs:
           else
             err "could not read the newest release of $DATA_REPO: $(head -c 300 "$d/err")"
           fi
-          state=$(GH_TOKEN="$OSM_DATA_TOKEN" gh api "repos/$DATA_REPO/actions/workflows/build.yml" --jq .state 2>"$d/err") || state="unknown ($(head -c 200 "$d/err"))"
+          # Reading the state needs no write access (the data repo is public);
+          # only re-enabling and dispatching need OSM_DATA_TOKEN.
+          state=$(gh api "repos/$DATA_REPO/actions/workflows/build.yml" --jq .state 2>"$d/err") || state="unknown ($(head -c 200 "$d/err"))"
           echo "build.yml state: $state"
+          if [ -z "$OSM_DATA_TOKEN" ]; then echo "::notice::OSM_DATA_TOKEN is not set: the build can be watched but not re-enabled or dispatched"; fi
           if [ "$state" != "active" ]; then
-            if GH_TOKEN="$OSM_DATA_TOKEN" gh workflow enable build.yml --repo "$DATA_REPO"; then
+            if [ -n "$OSM_DATA_TOKEN" ] && GH_TOKEN="$OSM_DATA_TOKEN" gh workflow enable build.yml --repo "$DATA_REPO"; then
               err "build.yml was $state: re-enabled"
             else
               err "build.yml is $state and could not be re-enabled (is OSM_DATA_TOKEN expired?)"
@@ -110,7 +118,7 @@ jobs:
               err "newest data is ${age_h:-?} h old; a build is already $st: $url"
             elif [ "${concl:-}" != "success" ] && [ "$since_h" -lt 72 ]; then
               err "newest data is ${age_h:-?} h old and the last build ($concl, ${since_h} h ago) failed: not dispatched again for 72 h, look at $url"
-            elif GH_TOKEN="$OSM_DATA_TOKEN" gh workflow run build.yml --repo "$DATA_REPO"; then
+            elif [ -n "$OSM_DATA_TOKEN" ] && GH_TOKEN="$OSM_DATA_TOKEN" gh workflow run build.yml --repo "$DATA_REPO"; then
               err "newest data is ${age_h:-?} h old: dispatched a build"
             else
               err "newest data is ${age_h:-?} h old and a build could not be dispatched (is OSM_DATA_TOKEN expired?)"
@@ -135,8 +143,24 @@ jobs:
           echo "newest $tag, pinned $pinned"
           if [ "$tag" = "$pinned" ]; then exit 0; fi
           d=$(mktemp -d)
+          gh release download "$tag" --repo "$DATA_REPO" --dir "$d" --pattern manifest.json
+          # A rebuild of the same extracts (same data_as_of) is not a new pin:
+          # say so and stop here, before ~80 MB of packs are downloaded.
+          if ! python3 -I - "$d/manifest.json" <<'EOF'
+          import json, sys
+          new = json.load(open(sys.argv[1]))['data_as_of_epoch']
+          try:
+              old = json.load(open('data/osm-manifest.json')).get('data_as_of_epoch')
+          except (OSError, ValueError):
+              old = None
+          sys.exit(0 if old is None or new > old else 1)
+          EOF
+          then
+            echo "::notice::$tag's data is not newer than the pinned $pinned's: nothing to pin"
+            exit 0
+          fi
           gh release download "$tag" --repo "$DATA_REPO" --dir "$d" \
-            --pattern manifest.json --pattern lighting.pack --pattern places.pack
+            --pattern lighting.pack --pattern places.pack
           for f in manifest.json lighting.pack places.pack; do
             gh attestation verify "$d/$f" --repo "$DATA_REPO" \
               --signer-workflow "$DATA_REPO/.github/workflows/build.yml" \
