@@ -9,21 +9,21 @@
    "sha256": "bea6792fc1a68cb4bb3905c3039fd36a31ff97d26009363b428382c71dd640fb"
   },
   "lighting.pack": {
-   "bytes": 67516216,
-   "sha256": "959ea87d89836836968ec9515f7a227a9d2bf0a6ed16c2dae91059eb356e3916"
+   "bytes": 67643119,
+   "sha256": "88e379c461b75131b25b3a4dce8b91b6376ab0f4e09317d60cfc5042b708d8a9"
   },
   "places.pack": {
-   "bytes": 9919247,
-   "sha256": "b162e9d36bad82d9972252671ce256ab57da28f1da3f50983f3ff97c3d781a60"
+   "bytes": 9925120,
+   "sha256": "8912357045415fb3c93610c5e274134480e21488a26a82eceecd33045e741c41"
   }
  },
- "built_at": "2026-11-02T00:19:58Z",
+ "built_at": "2026-11-11T02:32:26Z",
  "counts": {
-  "lit_ways": 1533953,
-  "places": 72726
+  "lit_ways": 1537590,
+  "places": 72792
  },
- "data_as_of": "2026-10-31T21:23:06Z",
- "data_as_of_epoch": 1793481786,
- "manifest_sha256": "79b529eb3bf05cb88beac21355c9f39d7d23429135806fdcb3cd496baedbd1c9",
- "tag": "data-2026-11-01-r2"
+ "data_as_of": "2026-11-08T21:21:00Z",
+ "data_as_of_epoch": 1794172860,
+ "manifest_sha256": "da39619720c416a8fdcc6380e051aaa528bff55845c50b4649859d5a6f9f3385",
+ "tag": "data-2026-11-11"
 }
